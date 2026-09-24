@@ -181,17 +181,12 @@ impl OpenCodeGoProvider {
             Err(console_error) if capabilities.legacy && is_recoverable(&console_error) => {
                 match self.fetch_legacy(cookie_header).await {
                     Ok(result) => Ok(result),
-                    // Console reported something more specific than "signed
-                    // out" and we have a Console cookie to have trusted it
-                    // with — prefer that diagnosis over the legacy scraper's
-                    // generic failure.
-                    Err(_legacy_error)
-                        if capabilities.console
-                            && !matches!(console_error, ProviderError::AuthRequired) =>
-                    {
-                        Err(console_error)
-                    }
-                    Err(legacy_error) => Err(legacy_error),
+                    // Both paths failed — surface both causes. Silently
+                    // preferring one used to hide the real failure behind
+                    // whichever path happened to fail with a vaguer message.
+                    Err(legacy_error) => Err(ProviderError::Other(format!(
+                        "Console: {console_error}; Legacy: {legacy_error}"
+                    ))),
                 }
             }
             Err(error) => Err(error),
