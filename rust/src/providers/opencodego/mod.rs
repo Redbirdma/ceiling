@@ -94,6 +94,27 @@ impl OpenCodeGoProvider {
         console::normalize_workspace_id(workspace_id)
     }
 
+    /// The legacy scraper addresses `/workspace/<id>/go`, which only accepts
+    /// `wrk_` IDs, so an `org_` override (including one normalized out of a
+    /// Console URL) still falls back to discovery.
+    fn legacy_workspace_id_from_context(workspace_id: Option<&str>) -> Option<String> {
+        Self::workspace_id_from_context(workspace_id).filter(|id| id.starts_with("wrk_"))
+    }
+
+    /// Two auth failures are still an auth failure, so the browser-cookie path
+    /// can end in the sign-in prompt; any other pair keeps both causes.
+    fn combine_fallback_errors(
+        console_error: ProviderError,
+        legacy_error: ProviderError,
+    ) -> ProviderError {
+        match (&console_error, &legacy_error) {
+            (ProviderError::AuthRequired, ProviderError::AuthRequired) => {
+                ProviderError::AuthRequired
+            }
+            _ => ProviderError::Other(format!("Console: {console_error}; Legacy: {legacy_error}")),
+        }
+    }
+
     /// Zen balance is credit *remaining*, so it is attached as an info-only
     /// extra window and deliberately never turned into a `CostSnapshot`:
     /// doing so would make spend fall as the user spends, and read $0 at
@@ -143,8 +164,12 @@ impl OpenCodeGoProvider {
     async fn fetch_legacy(
         &self,
         cookie_header: &str,
+        workspace_override: Option<&str>,
     ) -> Result<ProviderFetchResult, ProviderError> {
-        let workspace_id = legacy::discover_workspace_id(&self.client, cookie_header).await?;
+        let workspace_id = match Self::legacy_workspace_id_from_context(workspace_override) {
+            Some(id) => id,
+            None => legacy::discover_workspace_id(&self.client, cookie_header).await?,
+        };
         let legacy::LegacyUsage {
             usage,
             embedded_balance,
@@ -179,14 +204,17 @@ impl OpenCodeGoProvider {
         {
             Ok(result) => Ok(result),
             Err(console_error) if capabilities.legacy && is_recoverable(&console_error) => {
-                match self.fetch_legacy(cookie_header).await {
+                match self
+                    .fetch_legacy(cookie_header, workspace_id_override)
+                    .await
+                {
                     Ok(result) => Ok(result),
                     // Both paths failed — surface both causes. Silently
                     // preferring one used to hide the real failure behind
                     // whichever path happened to fail with a vaguer message.
-                    Err(legacy_error) => Err(ProviderError::Other(format!(
-                        "Console: {console_error}; Legacy: {legacy_error}"
-                    ))),
+                    Err(legacy_error) => {
+                        Err(Self::combine_fallback_errors(console_error, legacy_error))
+                    }
                 }
             }
             Err(error) => Err(error),
@@ -288,6 +316,55 @@ mod tests {
             OpenCodeGoProvider::workspace_id_from_context(Some("")),
             None
         );
+    }
+
+    #[test]
+    fn legacy_uses_wrk_override_and_discovers_for_other_ids() {
+        assert_eq!(
+            OpenCodeGoProvider::legacy_workspace_id_from_context(Some("wrk_override")),
+            Some("wrk_override".to_string())
+        );
+        assert_eq!(
+            OpenCodeGoProvider::legacy_workspace_id_from_context(Some(
+                "https://opencode.ai/workspace/wrk_url123/go"
+            )),
+            Some("wrk_url123".to_string())
+        );
+        // An org ID is a valid Console workspace but not a legacy one.
+        assert_eq!(
+            OpenCodeGoProvider::legacy_workspace_id_from_context(Some("org_123")),
+            None
+        );
+        assert_eq!(
+            OpenCodeGoProvider::legacy_workspace_id_from_context(None),
+            None
+        );
+    }
+
+    #[test]
+    fn double_auth_required_stays_auth_required() {
+        assert!(matches!(
+            OpenCodeGoProvider::combine_fallback_errors(
+                ProviderError::AuthRequired,
+                ProviderError::AuthRequired
+            ),
+            ProviderError::AuthRequired
+        ));
+    }
+
+    #[test]
+    fn mixed_double_failure_keeps_both_causes() {
+        let error = OpenCodeGoProvider::combine_fallback_errors(
+            ProviderError::Parse("console broke".to_string()),
+            ProviderError::Other("legacy broke".to_string()),
+        );
+        match error {
+            ProviderError::Other(message) => {
+                assert!(message.contains("console broke"));
+                assert!(message.contains("legacy broke"));
+            }
+            other => panic!("expected combined Other, got {other:?}"),
+        }
     }
 
     #[test]
