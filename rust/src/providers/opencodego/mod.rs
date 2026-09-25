@@ -38,6 +38,14 @@ struct CookieCapabilities {
     legacy: bool,
 }
 
+/// Why the Console-first attempt produced no snapshot. `NoSubscription` is
+/// terminal: the Console answered authoritatively, so it is surfaced instead
+/// of retried against the legacy scraper.
+enum ConsoleError {
+    NoSubscription,
+    Failed(ProviderError),
+}
+
 fn cookie_capabilities(cookie_header: &str) -> CookieCapabilities {
     let has_cookie = |names: &[&str]| {
         cookie_header.split(';').any(|part| {
@@ -131,15 +139,16 @@ impl OpenCodeGoProvider {
         &self,
         cookie_header: &str,
         workspace_override: Option<&str>,
-    ) -> Result<ProviderFetchResult, ProviderError> {
+    ) -> Result<ProviderFetchResult, ConsoleError> {
         let workspace_id = match Self::workspace_id_from_context(workspace_override) {
             Some(id) => id,
-            None => {
-                console::fetch_workspace_id(&self.client, cookie_header, CONSOLE_TIMEOUT).await?
-            }
+            None => console::fetch_workspace_id(&self.client, cookie_header, CONSOLE_TIMEOUT)
+                .await
+                .map_err(ConsoleError::Failed)?,
         };
         match console::fetch_usage(&self.client, &workspace_id, cookie_header, CONSOLE_TIMEOUT)
-            .await?
+            .await
+            .map_err(ConsoleError::Failed)?
         {
             console::ConsoleUsage::Snapshot(usage) => {
                 let mut usage = *usage;
@@ -155,9 +164,7 @@ impl OpenCodeGoProvider {
                 }
                 Ok(ProviderFetchResult::new(usage, "web"))
             }
-            console::ConsoleUsage::NoSubscription => Err(ProviderError::Parse(
-                "No OpenCode Go subscription is available".to_string(),
-            )),
+            console::ConsoleUsage::NoSubscription => Err(ConsoleError::NoSubscription),
         }
     }
 
@@ -203,7 +210,12 @@ impl OpenCodeGoProvider {
             .await
         {
             Ok(result) => Ok(result),
-            Err(console_error) if capabilities.legacy && is_recoverable(&console_error) => {
+            Err(ConsoleError::NoSubscription) => Err(ProviderError::Parse(
+                "No OpenCode Go subscription is available".to_string(),
+            )),
+            Err(ConsoleError::Failed(console_error))
+                if capabilities.legacy && is_recoverable(&console_error) =>
+            {
                 match self
                     .fetch_legacy(cookie_header, workspace_id_override)
                     .await
@@ -217,7 +229,7 @@ impl OpenCodeGoProvider {
                     }
                 }
             }
-            Err(error) => Err(error),
+            Err(ConsoleError::Failed(error)) => Err(error),
         }
     }
 }
